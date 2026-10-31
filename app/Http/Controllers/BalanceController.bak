@@ -1,0 +1,169 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Actions\Balance\WithdrawValidationAction;
+use App\Enums\BalanceStatementStatus;
+use App\Enums\BalanceStatementType;
+use App\Exceptions\Wallet\InsufficientBalance;
+use App\Exceptions\WithdrawException;
+use App\Models\BalanceStatement;
+use App\Models\User;
+use App\Services\Novus;
+use App\Services\OpenPix;
+use Illuminate\Support\Str;
+use App\Settings\DepositSetting;
+use App\Settings\WithdrawSetting;
+use DateTime;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+class BalanceController extends Controller
+{
+    public function deposit(DepositSetting $depositSetting, Request $request)
+    {
+        $data = $request->validate([
+            'value' => 'required|numeric'
+        ]);
+
+        if ($data["value"] < $depositSetting->minimum_value) {
+            return response()->json([
+                "success" => false,
+                "message" => 'Falha no depósito',
+                "policy" => 'minimum_value'
+            ], 400);
+        }
+
+        try {
+            $uuid = Str::uuid();
+
+            $op = new OpenPix;
+            $pix = $op->createPix($uuid, $data["value"])->throw()->json();
+
+            $bs = BalanceStatement::create([
+                "uuid" => $uuid,
+                "type" => BalanceStatementType::Deposit,
+                "value" => $data["value"],
+                "external_id" => $pix["charge"]["transactionID"],
+                "qr_code" => $pix["charge"]["brCode"],
+                "qr_code_image" => $pix["charge"]["qrCodeImage"],
+                "payment_link" => $pix["charge"]["paymentLinkUrl"],
+                "expiration" => (new DateTime($pix["charge"]["expiresDate"]))->format("Y-m-d H:i:s"),
+                "status" => BalanceStatementStatus::Pending,
+                "user_id" => $request->user()->id
+            ]);
+
+
+            return [
+                "success" => true,
+                "message" => "Deposito criado com sucesso",
+                "qrCode" => $bs->qr_code,
+                "qrCodeImage" => $bs->qr_code_image,
+                "paymentLink" => $bs->payment_link,
+                "statement_id" => $uuid
+            ];
+        } catch (\Throwable $e) {
+
+            Log::error('Deposito ERROR: ' . $e->getMessage());
+
+            return response()->json([
+                "success" => false,
+                "message" => $e->getMessage()
+            ], 400);
+        }
+    }
+
+
+    public function withdraw(Request $request)
+    {
+        $data = $request->validate([
+            'value' => 'required|numeric'
+        ]);
+
+        try {
+            (new WithdrawValidationAction)->handle($request->user(), $data['value']);
+        } catch (WithdrawException $e) {
+            return response()->json([
+                "success" => false,
+                "message" => $e->getMessage(),
+                /** @var \App\Enums\WithdrawErrorPolicies */
+                "policy" => $e->policy->value
+            ], 401);
+        } catch (\Exception $e) {
+            return response()->json([
+                "success" => false,
+                "message" => 'Falha no saque, ocorreu um erro interno',
+            ], 500);
+        }
+
+
+        try {
+            $uuid = Str::uuid();
+            $amount = $data["value"];
+            $user = $request->user();
+            $external_id = DB::transaction(function () use ($amount, $user, $uuid) {
+                $user = User::lockForUpdate()->select("id", "balance", "pix", "pix_type")->where("id", $user->id)->first();
+                if ($user->balance < $amount) throw new InsufficientBalance();
+
+                $op = new OpenPix;
+                $pix = $op->withdrawPix($uuid, $amount, $user->pix, $user->pix_type->value)->throw()->json();
+
+                BalanceStatement::create([
+                    "uuid" => $uuid,
+                    "type" => BalanceStatementType::Withdraw,
+                    "value" => $amount,
+                    "external_id" => $pix["transaction"]["endToEndId"],
+                    "status" => BalanceStatementStatus::Completed,
+                    "user_id" => $user->id
+                ]);
+
+                $user->decrement("balance", $amount);
+
+                return $pix["transaction"]["endToEndId"];
+            }, 5);
+
+
+            return [
+                "success" => true,
+                "message" => "Saque efetuado com sucesso",
+                "external_id" => $external_id
+            ];
+        } catch (InsufficientBalance $e) {
+            return response()->json([
+                "success" => false,
+                "message" => 'Não foi possível fazer o saque, saldo insuficiente.',
+                "policy" => "insufficient_balance"
+            ], 400);
+        } catch (\Exception $e) {
+            Log::emergency("Saque ERROR");
+            Log::emergency($e);
+            return response()->json([
+                "success" => false,
+                "message" => 'Não foi possível fazer o saque'
+            ], 400);
+        }
+    }
+
+    function statements(Request $request)
+    {
+        $statements = BalanceStatement::where("user_id", $request->user()->id)->orderBy("id", "desc")->paginate();
+
+        return [
+            "success" => true,
+            /** @var LengthAwarePaginator<BalanceStatement> **/
+            "statements" => $statements
+        ];
+    }
+
+    function statement(Request $request, $id)
+    {
+        $statement = BalanceStatement::where("user_id", $request->user()->id)->where("uuid", $id)->firstOrFail();
+
+        return [
+            "success" => true,
+            /** @var BalanceStatement **/
+            "statement" => $statement
+        ];
+    }
+}
